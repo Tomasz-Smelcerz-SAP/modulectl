@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -13,18 +14,82 @@ import (
 
 const httpGetTimeout = 20 * time.Second
 
-var errBadHTTPStatus = errors.New("bad http status")
+var (
+	errBadHTTPStatus    = errors.New("bad http status")
+	errSSRFRedirect     = errors.New("redirect blocked: destination is a private or non-https address")
+)
+
+var privateRanges = func() []*net.IPNet {
+	var ranges []*net.IPNet
+	for _, cidr := range []string{
+		"127.0.0.0/8",    // loopback
+		"::1/128",        // IPv6 loopback
+		"10.0.0.0/8",     // RFC1918
+		"172.16.0.0/12",  // RFC1918
+		"192.168.0.0/16", // RFC1918
+		"169.254.0.0/16", // link-local / cloud metadata
+		"fe80::/10",      // IPv6 link-local
+	} {
+		_, ipNet, _ := net.ParseCIDR(cidr)
+		ranges = append(ranges, ipNet)
+	}
+	return ranges
+}()
+
+func isPrivateIP(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, r := range privateRanges {
+		if r.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func checkRedirect(req *http.Request, _ []*http.Request) error {
+	// Relative redirects have no host — the client resolves them against the original
+	// (already-validated) host, so they cannot change scheme or destination.
+	if !req.URL.IsAbs() {
+		return nil
+	}
+	if req.URL.Scheme != "https" {
+		return errSSRFRedirect
+	}
+	host := req.URL.Hostname()
+	if isPrivateIP(host) {
+		return errSSRFRedirect
+	}
+	addrs, err := net.LookupHost(host)
+	if err != nil {
+		return fmt.Errorf("failed to resolve redirect host %s: %w", host, err)
+	}
+	for _, addr := range addrs {
+		if isPrivateIP(addr) {
+			return errSSRFRedirect
+		}
+	}
+	return nil
+}
+
+var ssrfSafeClient = &http.Client{
+	Timeout:       httpGetTimeout,
+	CheckRedirect: checkRedirect,
+}
 
 type TempFileSystem struct {
-	files []*os.File
+	files      []*os.File
+	httpClient *http.Client
 }
 
 func NewTempFileSystem() *TempFileSystem {
-	return &TempFileSystem{files: []*os.File{}}
+	return &TempFileSystem{files: []*os.File{}, httpClient: ssrfSafeClient}
 }
 
 func (fs *TempFileSystem) DownloadTempFile(dir, pattern string, url *url.URL) (string, error) {
-	bytes, err := getBytesFromURL(url)
+	bytes, err := fs.getBytesFromURL(url)
 	if err != nil {
 		return "", fmt.Errorf("failed to download file from %s: %w", url, err)
 	}
@@ -65,7 +130,7 @@ func (fs *TempFileSystem) RemoveTempFiles() []error {
 	return errs
 }
 
-func getBytesFromURL(url *url.URL) ([]byte, error) {
+func (fs *TempFileSystem) getBytesFromURL(url *url.URL) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), httpGetTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url.String(), nil)
@@ -73,7 +138,7 @@ func getBytesFromURL(url *url.URL) ([]byte, error) {
 		return nil, fmt.Errorf("failed to create HTTP GET request for %s: %w", url, err)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := fs.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP GET request failed for %s: %w", url, err)
 	}
