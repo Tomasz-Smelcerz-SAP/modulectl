@@ -9,19 +9,19 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"time"
 )
 
 const httpGetTimeout = 20 * time.Second
 
 var (
-	errBadHTTPStatus    = errors.New("bad http status")
-	errSSRFRedirect     = errors.New("redirect blocked: destination is a private or non-https address")
+	errBadHTTPStatus = errors.New("bad http status")
+	errSSRFRedirect  = errors.New("redirect blocked: destination is a private or non-https address")
 )
 
-var privateRanges = func() []*net.IPNet {
-	var ranges []*net.IPNet
-	for _, cidr := range []string{
+func privateRanges() []*net.IPNet {
+	cidrs := []string{
 		"127.0.0.0/8",    // loopback
 		"::1/128",        // IPv6 loopback
 		"10.0.0.0/8",     // RFC1918
@@ -29,24 +29,23 @@ var privateRanges = func() []*net.IPNet {
 		"192.168.0.0/16", // RFC1918
 		"169.254.0.0/16", // link-local / cloud metadata
 		"fe80::/10",      // IPv6 link-local
-	} {
+	}
+	ranges := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
 		_, ipNet, _ := net.ParseCIDR(cidr)
 		ranges = append(ranges, ipNet)
 	}
 	return ranges
-}()
+}
 
 func isPrivateIP(host string) bool {
 	ip := net.ParseIP(host)
 	if ip == nil {
 		return false
 	}
-	for _, r := range privateRanges {
-		if r.Contains(ip) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(privateRanges(), func(r *net.IPNet) bool {
+		return r.Contains(ip)
+	})
 }
 
 func checkRedirect(req *http.Request, _ []*http.Request) error {
@@ -62,21 +61,14 @@ func checkRedirect(req *http.Request, _ []*http.Request) error {
 	if isPrivateIP(host) {
 		return errSSRFRedirect
 	}
-	addrs, err := net.LookupHost(host)
+	addrs, err := net.DefaultResolver.LookupHost(req.Context(), host)
 	if err != nil {
 		return fmt.Errorf("failed to resolve redirect host %s: %w", host, err)
 	}
-	for _, addr := range addrs {
-		if isPrivateIP(addr) {
-			return errSSRFRedirect
-		}
+	if slices.ContainsFunc(addrs, isPrivateIP) {
+		return errSSRFRedirect
 	}
 	return nil
-}
-
-var ssrfSafeClient = &http.Client{
-	Timeout:       httpGetTimeout,
-	CheckRedirect: checkRedirect,
 }
 
 type TempFileSystem struct {
@@ -85,7 +77,13 @@ type TempFileSystem struct {
 }
 
 func NewTempFileSystem() *TempFileSystem {
-	return &TempFileSystem{files: []*os.File{}, httpClient: ssrfSafeClient}
+	return &TempFileSystem{
+		files: []*os.File{},
+		httpClient: &http.Client{
+			Timeout:       httpGetTimeout,
+			CheckRedirect: checkRedirect,
+		},
+	}
 }
 
 func (fs *TempFileSystem) DownloadTempFile(dir, pattern string, url *url.URL) (string, error) {

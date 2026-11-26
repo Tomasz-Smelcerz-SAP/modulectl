@@ -38,7 +38,7 @@ func TestDownloadTempFile_DirectHTTPS_Succeeds(t *testing.T) {
 func TestDownloadTempFile_SameHostPathRedirect_Succeeds(t *testing.T) {
 	// A single TLS server that redirects /redirect -> /content on the same host.
 	// Go resolves this to an absolute URL with the same scheme+host before calling
-	// CheckRedirect, so the same-host redirect is exercised end-to-end.
+	// checkRedirect, so the same-host redirect is exercised end-to-end.
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/redirect" {
 			http.Redirect(w, r, "/content", http.StatusFound)
@@ -69,7 +69,7 @@ func makeReq(t *testing.T, rawURL string) *http.Request {
 	t.Helper()
 	u, err := url.Parse(rawURL)
 	require.NoError(t, err)
-	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, u.String(), nil)
 	require.NoError(t, err)
 	return req
 }
