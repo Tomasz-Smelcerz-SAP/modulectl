@@ -23,7 +23,6 @@ var (
 	errBadHTTPStatus    = errors.New("bad http status")
 	errSSRFRedirect     = errors.New("redirect blocked: destination is a private or non-https address")
 	errTooManyRedirects = errors.New("redirect blocked: too many redirects")
-	errDialFailed       = errors.New("could not connect to host")
 )
 
 func privateRanges() []*net.IPNet {
@@ -91,41 +90,12 @@ type TempFileSystem struct {
 	httpClient *http.Client
 }
 
-// safeDialContext resolves host, rejects any private IP, then dials the first
-// validated address directly. This pins the connection to the validated IP and
-// prevents DNS rebinding (a second resolver call at connect time).
-func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse dial address %s: %w", addr, err)
-	}
-	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve host %s: %w", host, err)
-	}
-	var dialer net.Dialer
-	for _, ip := range addrs {
-		if isPrivateIP(ip) {
-			return nil, errSSRFRedirect
-		}
-		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
-		if err == nil {
-			return conn, nil
-		}
-	}
-	return nil, fmt.Errorf("%w: %s", errDialFailed, host)
-}
-
 func NewTempFileSystem() *TempFileSystem {
-	//nolint:forcetypeassert // http.DefaultTransport is always *http.Transport
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DialContext = safeDialContext
 	return &TempFileSystem{
 		files: []*os.File{},
 		httpClient: &http.Client{
 			Timeout:       httpGetTimeout,
 			CheckRedirect: checkRedirect,
-			Transport:     transport,
 		},
 	}
 }
