@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -157,4 +158,31 @@ func TestCheckRedirect_TooManyRedirects_Blocked(t *testing.T) {
 	err := checkRedirect(req, via)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "too many redirects")
+}
+
+// --- ssrfDialControl tests ---
+
+func TestSSRFDialControl_PublicIP_Allowed(t *testing.T) {
+	err := ssrfDialControl(t.Context(), "tcp", "1.1.1.1:443", syscall.RawConn(nil))
+	require.NoError(t, err)
+}
+
+func TestSSRFDialControl_PrivateIP_Blocked(t *testing.T) {
+	// Use NewTempFileSystem (which wires ssrfDialControl) and attempt a real dial to
+	// a loopback httptest server — the stdlib calls ssrfDialControl with the resolved
+	// IP before connect(), which must reject it.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	parsedURL, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+
+	fs := NewTempFileSystem()
+	t.Cleanup(func() { _ = fs.RemoveTempFiles() })
+
+	_, err = fs.DownloadTempFile("", "test-*", parsedURL)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "redirect blocked")
 }
