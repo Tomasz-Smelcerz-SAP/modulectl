@@ -158,3 +158,39 @@ func TestCheckRedirect_TooManyRedirects_Blocked(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "too many redirects")
 }
+
+func TestCheckRedirect_LoopbackHostname_Blocked(t *testing.T) {
+	// Exercises the DNS resolution path in checkRedirect: "localhost" resolves to
+	// 127.0.0.1/::1, both of which are in the loopback private range.
+	req := makeReq(t, "https://localhost/secret")
+	err := checkRedirect(req, nil)
+	require.ErrorIs(t, err, errSSRFRedirect)
+}
+
+func TestDownloadTempFile_ProhibitedRedirect_Blocked(t *testing.T) {
+	// destination is the server that would serve the secret — never contacted if policy works.
+	destination := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("secret"))
+	}))
+	t.Cleanup(destination.Close)
+
+	// origin redirects to the destination (same loopback host, different path/port).
+	// Both servers share the same test TLS certificate so srv.Client() trusts both.
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, destination.URL, http.StatusFound)
+	}))
+	t.Cleanup(origin.Close)
+
+	parsedURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+
+	// Use NewTempFileSystem for production policy, but replace the transport so the
+	// test TLS certificate is trusted. CheckRedirect remains the production one.
+	fs := NewTempFileSystem()
+	fs.httpClient.Transport = origin.Client().Transport
+	t.Cleanup(func() { _ = fs.RemoveTempFiles() })
+
+	_, err = fs.DownloadTempFile("", "test-*", parsedURL)
+	require.ErrorIs(t, err, errSSRFRedirect)
+}
