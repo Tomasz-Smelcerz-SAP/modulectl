@@ -11,7 +11,6 @@ import (
 	"os"
 	"slices"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -86,37 +85,17 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-// ssrfDialControl is set as net.Dialer.ControlContext. It is called by the
-// standard library after DNS resolution and socket creation but before connect(),
-// so the address is already a resolved IP:port — not a hostname. This closes
-// the TOCTOU gap in checkRedirect without replacing any stdlib dial logic.
-func ssrfDialControl(_ context.Context, _, address string, _ syscall.RawConn) error {
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		return fmt.Errorf("failed to parse dial address %s: %w", address, err)
-	}
-	if isPrivateIP(host) {
-		return errSSRFRedirect
-	}
-	return nil
-}
-
 type TempFileSystem struct {
 	files      []*os.File
 	httpClient *http.Client
 }
 
 func NewTempFileSystem() *TempFileSystem {
-	dialer := &net.Dialer{ControlContext: ssrfDialControl}
-	//nolint:forcetypeassert // http.DefaultTransport is always *http.Transport
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DialContext = dialer.DialContext
 	return &TempFileSystem{
 		files: []*os.File{},
 		httpClient: &http.Client{
 			Timeout:       httpGetTimeout,
 			CheckRedirect: checkRedirect,
-			Transport:     transport,
 		},
 	}
 }
