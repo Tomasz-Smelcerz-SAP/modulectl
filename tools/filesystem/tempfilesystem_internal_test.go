@@ -75,7 +75,9 @@ func makeReq(t *testing.T, rawURL string) *http.Request {
 }
 
 func TestCheckRedirect_HTTPSPublicHost_Allowed(t *testing.T) {
-	req := makeReq(t, "https://raw.githubusercontent.com/some/repo/file.yaml")
+	// Use a public IP literal to avoid a live DNS lookup in unit tests.
+	// 1.1.1.1 is Cloudflare's public resolver — not in any private range.
+	req := makeReq(t, "https://1.1.1.1/some/file.yaml")
 	err := checkRedirect(req, nil)
 	require.NoError(t, err)
 }
@@ -89,6 +91,13 @@ func TestCheckRedirect_HTTPScheme_Blocked(t *testing.T) {
 
 func TestCheckRedirect_Loopback_Blocked(t *testing.T) {
 	req := makeReq(t, "https://127.0.0.1/secret")
+	err := checkRedirect(req, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "redirect blocked")
+}
+
+func TestCheckRedirect_IPv6Loopback_Blocked(t *testing.T) {
+	req := makeReq(t, "https://[::1]/secret")
 	err := checkRedirect(req, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "redirect blocked")
@@ -112,4 +121,40 @@ func TestCheckRedirect_LinkLocal_Blocked(t *testing.T) {
 	err := checkRedirect(req, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "redirect blocked")
+}
+
+func TestCheckRedirect_IPv6LinkLocal_Blocked(t *testing.T) {
+	req := makeReq(t, "https://[fe80::1]/secret")
+	err := checkRedirect(req, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "redirect blocked")
+}
+
+func TestCheckRedirect_IPv6UniqueLocal_Blocked(t *testing.T) {
+	for _, addr := range []string{
+		"https://[fc00::1]/secret",
+		"https://[fd00::1]/secret",
+	} {
+		req := makeReq(t, addr)
+		err := checkRedirect(req, nil)
+		require.Error(t, err, "expected block for %s", addr)
+		assert.Contains(t, err.Error(), "redirect blocked")
+	}
+}
+
+func TestCheckRedirect_ScopedIPv6LinkLocal_Blocked(t *testing.T) {
+	// fe80::1%eth0 — zone ID must be stripped before classification.
+	// url.Parse percent-encodes the '%' as '%25', Hostname() decodes it back.
+	req := makeReq(t, "https://[fe80::1%25eth0]/secret")
+	err := checkRedirect(req, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "redirect blocked")
+}
+
+func TestCheckRedirect_TooManyRedirects_Blocked(t *testing.T) {
+	req := makeReq(t, "https://1.1.1.1/file.yaml")
+	via := make([]*http.Request, maxRedirects)
+	err := checkRedirect(req, via)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "too many redirects")
 }

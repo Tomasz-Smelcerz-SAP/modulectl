@@ -10,14 +10,20 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strings"
 	"time"
 )
 
-const httpGetTimeout = 20 * time.Second
+const (
+	httpGetTimeout = 20 * time.Second
+	maxRedirects   = 10
+)
 
 var (
-	errBadHTTPStatus = errors.New("bad http status")
-	errSSRFRedirect  = errors.New("redirect blocked: destination is a private or non-https address")
+	errBadHTTPStatus    = errors.New("bad http status")
+	errSSRFRedirect     = errors.New("redirect blocked: destination is a private or non-https address")
+	errTooManyRedirects = errors.New("redirect blocked: too many redirects")
+	errDialFailed       = errors.New("could not connect to host")
 )
 
 func privateRanges() []*net.IPNet {
@@ -29,6 +35,7 @@ func privateRanges() []*net.IPNet {
 		"192.168.0.0/16", // RFC1918
 		"169.254.0.0/16", // link-local / cloud metadata
 		"fe80::/10",      // IPv6 link-local
+		"fc00::/7",       // IPv6 unique-local (fc00::/7 covers fc00:: and fd00::)
 	}
 	ranges := make([]*net.IPNet, 0, len(cidrs))
 	for _, cidr := range cidrs {
@@ -39,6 +46,11 @@ func privateRanges() []*net.IPNet {
 }
 
 func isPrivateIP(host string) bool {
+	// Strip zone identifier from scoped IPv6 literals (e.g. "fe80::1%eth0") so
+	// net.ParseIP can classify them; zone IDs are not part of the routable address.
+	if i := strings.IndexByte(host, '%'); i != -1 {
+		host = host[:i]
+	}
 	ip := net.ParseIP(host)
 	if ip == nil {
 		return false
@@ -48,7 +60,10 @@ func isPrivateIP(host string) bool {
 	})
 }
 
-func checkRedirect(req *http.Request, _ []*http.Request) error {
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return errTooManyRedirects
+	}
 	// Relative redirects have no host — the client resolves them against the original
 	// (already-validated) host, so they cannot change scheme or destination.
 	if !req.URL.IsAbs() {
@@ -76,12 +91,41 @@ type TempFileSystem struct {
 	httpClient *http.Client
 }
 
+// safeDialContext resolves host, rejects any private IP, then dials the first
+// validated address directly. This pins the connection to the validated IP and
+// prevents DNS rebinding (a second resolver call at connect time).
+func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse dial address %s: %w", addr, err)
+	}
+	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve host %s: %w", host, err)
+	}
+	var dialer net.Dialer
+	for _, ip := range addrs {
+		if isPrivateIP(ip) {
+			return nil, errSSRFRedirect
+		}
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
+		if err == nil {
+			return conn, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: %s", errDialFailed, host)
+}
+
 func NewTempFileSystem() *TempFileSystem {
+	//nolint:forcetypeassert // http.DefaultTransport is always *http.Transport
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = safeDialContext
 	return &TempFileSystem{
 		files: []*os.File{},
 		httpClient: &http.Client{
 			Timeout:       httpGetTimeout,
 			CheckRedirect: checkRedirect,
+			Transport:     transport,
 		},
 	}
 }
